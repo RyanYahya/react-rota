@@ -1,0 +1,608 @@
+'use client'
+
+import React, { useState, useEffect } from 'react'
+import { format, addDays, startOfMonth, endOfMonth, isWeekend, differenceInDays, isSameMonth, eachDayOfInterval } from 'date-fns'
+import { Button } from "@/components/ui/button"
+import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
+import { Input } from "@/components/ui/input"
+import { Label } from "@/components/ui/label"
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
+import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table"
+import { ScrollArea } from "@/components/ui/scroll-area"
+import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip"
+import { useToast } from "@/components/ui/use-toast"
+import { X, HelpCircle, Download } from 'lucide-react'
+
+const teamStructure = {
+  "Team A": {
+    lead: "Rayyan Alyahya",
+    members: ["Abdullah Alahmari", "Abdulkarim Alshadookhi", "Ahmad Abkar", "Ban Alzaid", "Mohammad Kamal"]
+  },
+  "Team B": {
+    lead: "Hazim Jokhadar",
+    members: ["Saeed Alshahrani", "Abdullah Alsadoun", "Saeed Abdulnoor", "Raed Alghamdi", "Adel Asiri"]
+  },
+  "Allocation Team": ["Khalid Alroqi", "Mariah Alamri"]
+}
+
+const allDoctors = [
+  ...Object.values(teamStructure).flatMap(team => 
+    Array.isArray(team) ? team : [team.lead, ...team.members]
+  )
+]
+
+type RotaEntry = {
+  doctor: string
+  team: string
+}
+
+type Vacation = {
+  doctor: string
+  startDate: Date
+  endDate: Date
+}
+
+type MobileTeamRotation = {
+  doctor: string
+  startDate: Date
+  endDate: Date
+}
+
+type Conflict = {
+  date: Date
+  description: string
+  suggestions: string[]
+}
+
+type CustomRules = {
+  maxOnCallsPerWeek: number
+  minDaysBetweenOnCalls: number
+}
+
+type DoctorStats = {
+  totalOnCalls: number
+  lastOnCall: Date | null
+  consecutiveDays: number
+}
+
+export default function RotaGenerator() {
+  const [selectedMonth, setSelectedMonth] = useState<Date>(new Date())
+  const [generatedRota, setGeneratedRota] = useState<Record<string, RotaEntry[]>>({})
+  const [vacations, setVacations] = useState<Vacation[]>([])
+  const [mobileTeamRotations, setMobileTeamRotations] = useState<MobileTeamRotation[]>([])
+  const [conflicts, setConflicts] = useState<Conflict[]>([])
+  const [customRules, setCustomRules] = useState<CustomRules>({ maxOnCallsPerWeek: 2, minDaysBetweenOnCalls: 3 })
+  const [onCallSummary, setOnCallSummary] = useState<Record<string, { midWeek: number, weekend: number, vacation: number, mobileTeam: number, total: number }>>({})
+  const { toast } = useToast()
+
+  const [newVacation, setNewVacation] = useState<{ doctor: string, startDate: string, endDate: string }>({ doctor: '', startDate: '', endDate: '' })
+  const [newMobileTeamRotation, setNewMobileTeamRotation] = useState<{ doctor: string, startDate: string, endDate: string }>({ doctor: '', startDate: '', endDate: '' })
+
+  const generateRota = () => {
+    const newRota: Record<string, RotaEntry[]> = {}
+    const startDate = startOfMonth(selectedMonth)
+    const endDate = endOfMonth(selectedMonth)
+    const doctorStats: Record<string, DoctorStats> = {}
+    allDoctors.forEach(doctor => {
+      doctorStats[doctor] = { totalOnCalls: 0, lastOnCall: null, consecutiveDays: 0 }
+    })
+
+    const teamAssignments: Record<string, number> = { "Team A": 0, "Team B": 0, "Allocation Team": 0 }
+    const daysInMonth = eachDayOfInterval({ start: startDate, end: endDate })
+
+    // Modified team rotation to reduce Allocation Team frequency
+    const teamRotation = ["Team A", "Team B", "Team A", "Team B", "Allocation Team"]
+    let teamIndex = 0
+
+    daysInMonth.forEach(date => {
+      const isWeekendDay = isWeekend(date)
+      const requiredDoctors = isWeekendDay ? 2 : 1
+      const assignedDoctors: RotaEntry[] = []
+
+      for (let i = 0; i < requiredDoctors; i++) {
+        const currentTeam = teamRotation[teamIndex]
+        const availableDoctors = getAvailableDoctors(date, currentTeam, doctorStats, teamAssignments)
+        if (availableDoctors.length > 0) {
+          const selectedDoctor = selectDoctor(availableDoctors, date, doctorStats, teamAssignments)
+          assignedDoctors.push({ doctor: selectedDoctor, team: currentTeam })
+          updateDoctorStats(selectedDoctor, date, doctorStats)
+          teamAssignments[currentTeam]++
+        } else {
+          setConflicts(prev => [...prev, {
+            date: date,
+            description: `No available doctors for ${format(date, 'yyyy-MM-dd')} in ${currentTeam}`,
+            suggestions: [`Consider adjusting vacations or mobile team rotations for ${currentTeam}`]
+          }])
+        }
+      }
+
+      newRota[format(date, 'd')] = assignedDoctors
+      teamIndex = (teamIndex + 1) % teamRotation.length
+    })
+
+    balanceSchedule(newRota, doctorStats, teamAssignments)
+    setGeneratedRota(newRota)
+    updateOnCallSummary(newRota)
+    toast({
+      title: "Schedule Generated",
+      description: "The on-call schedule has been generated with improved fairness.",
+    })
+  }
+
+  const getAvailableDoctors = (date: Date, team: string, doctorStats: Record<string, DoctorStats>, teamAssignments: Record<string, number>) => {
+    const teamDoctors = team === "Allocation Team" 
+      ? teamStructure[team]
+      : [teamStructure[team].lead, ...teamStructure[team].members]
+    
+    return teamDoctors.filter(doctor => {
+      const isAvailable = !isOnVacation(doctor, date) && !isOnMobileTeam(doctor, date)
+      const hasRestedEnough = !doctorStats[doctor].lastOnCall || differenceInDays(date, doctorStats[doctor].lastOnCall) >= customRules.minDaysBetweenOnCalls
+      const notExceededWeeklyLimit = doctorStats[doctor].consecutiveDays < customRules.maxOnCallsPerWeek
+      return isAvailable && hasRestedEnough && notExceededWeeklyLimit
+    })
+  }
+
+  const selectDoctor = (
+    availableDoctors: string[],
+    date: Date,
+    doctorStats: Record<string, DoctorStats>,
+    teamAssignments: Record<string, number>
+  ) => {
+    return availableDoctors.reduce((selected, doctor) => {
+      if (!selected) return doctor
+      const selectedTeam = getDoctorTeam(selected)
+      const doctorTeam = getDoctorTeam(doctor)
+      if (teamAssignments[doctorTeam] < teamAssignments[selectedTeam]) return doctor
+      if (doctorStats[doctor].totalOnCalls < doctorStats[selected].totalOnCalls) return doctor
+      if (!doctorStats[doctor].lastOnCall) return doctor
+      if (!doctorStats[selected].lastOnCall) return selected
+      return differenceInDays(date, doctorStats[doctor].lastOnCall) > 
+             differenceInDays(date, doctorStats[selected].lastOnCall) ? doctor : selected
+    })
+  }
+
+  const updateDoctorStats = (doctor: string, date: Date, doctorStats: Record<string, DoctorStats>) => {
+    const stats = doctorStats[doctor]
+    stats.totalOnCalls++
+    stats.lastOnCall = date
+    if (stats.lastOnCall && differenceInDays(date, stats.lastOnCall) === 1) {
+      stats.consecutiveDays++
+    } else {
+      stats.consecutiveDays = 1
+    }
+  }
+
+  const balanceSchedule = (rota: Record<string, RotaEntry[]>, doctorStats: Record<string, DoctorStats>, teamAssignments: Record<string, number>) => {
+    const teamAverages: Record<string, number> = {}
+    Object.keys(teamStructure).forEach(team => {
+      const teamDoctors = team === "Allocation Team" ? teamStructure[team] : [teamStructure[team].lead, ...teamStructure[team].members]
+      const teamTotal = teamDoctors.reduce((sum, doctor) => sum + doctorStats[doctor].totalOnCalls, 0)
+      teamAverages[team] = teamTotal / teamDoctors.length
+    })
+
+    Object.entries(rota).forEach(([date, entries]) => {
+      entries.forEach(entry => {
+        const doctorTeam = getDoctorTeam(entry.doctor)
+        if (doctorStats[entry.doctor].totalOnCalls > teamAverages[doctorTeam] + 1) {
+          const replacementDoctor = findReplacementDoctor(entry.doctor, new Date(selectedMonth.getFullYear(), selectedMonth.getMonth(), parseInt(date)), doctorStats, teamAverages)
+          if (replacementDoctor) {
+            entry.doctor = replacementDoctor
+            doctorStats[entry.doctor].totalOnCalls++
+            doctorStats[replacementDoctor].totalOnCalls--
+          }
+        }
+      })
+    })
+  }
+
+  const findReplacementDoctor = (currentDoctor: string, date: Date, doctorStats: Record<string, DoctorStats>, teamAverages: Record<string, number>) => {
+    const currentTeam = getDoctorTeam(currentDoctor)
+    const teamDoctors = currentTeam === "Allocation Team" ? teamStructure[currentTeam] : [teamStructure[currentTeam].lead, ...teamStructure[currentTeam].members]
+    
+    return teamDoctors.find(doctor => 
+      doctor !== currentDoctor &&
+      doctorStats[doctor].totalOnCalls < teamAverages[currentTeam] - 1 &&
+      !isOnVacation(doctor, date) &&
+      !isOnMobileTeam(doctor, date) &&
+      (!doctorStats[doctor].lastOnCall || differenceInDays(date, doctorStats[doctor].lastOnCall) >= customRules.minDaysBetweenOnCalls)
+    )
+  }
+
+  const updateOnCallSummary = (rota: Record<string, RotaEntry[]>) => {
+    const summary: Record<string, { midWeek: number, weekend: number, vacation: number, mobileTeam: number, total: number }> = {}
+    allDoctors.forEach(doctor => {
+      summary[doctor] = { midWeek: 0, weekend: 0, vacation: 0, mobileTeam: 0, total: 0 }
+    })
+
+    Object.entries(rota).forEach(([date, entries]) => {
+      const currentDate = new Date(selectedMonth.getFullYear(), selectedMonth.getMonth(), parseInt(date))
+      entries.forEach(entry => {
+        if (isWeekend(currentDate)) {
+          summary[entry.doctor].weekend++
+        } else {
+          summary[entry.doctor].midWeek++
+        }
+        summary[entry.doctor].total++
+      })
+    })
+
+    vacations.forEach(vacation => {
+      const days = differenceInDays(vacation.endDate, vacation.startDate) + 1
+      summary[vacation.doctor].vacation += days
+    })
+
+    mobileTeamRotations.forEach(rotation => {
+      const days = differenceInDays(rotation.endDate, rotation.startDate) + 1
+      summary[rotation.doctor].mobileTeam += days
+    })
+
+    setOnCallSummary(summary)
+  }
+
+  const isOnVacation = (doctor: string, date: Date) => {
+    return vacations.some(vacation => 
+      vacation.doctor === doctor && 
+      date >= vacation.startDate && 
+      date <= vacation.endDate
+    )
+  }
+
+  const isOnMobileTeam = (doctor: string, date: Date) => {
+    return mobileTeamRotations.some(rotation => 
+      rotation.doctor === doctor && 
+      date >= rotation.startDate && 
+      date <= rotation.endDate
+    )
+  }
+
+  const getDoctorTeam = (doctor: string): string => {
+    for (const [team, members] of Object.entries(teamStructure)) {
+      if (Array.isArray(members)) {
+        if (members.includes(doctor)) return team
+      } else if (members.lead === doctor || members.members.includes(doctor)) {
+        return team
+      }
+    }
+    return "Unknown Team"
+  }
+
+  const addVacation = () => {
+    if (newVacation.doctor && newVacation.startDate && newVacation.endDate) {
+      const startDate = new Date(newVacation.startDate)
+      const endDate = new Date(newVacation.endDate)
+      setVacations(prev => [...prev, { ...newVacation, startDate, endDate }])
+      setNewVacation({ doctor: '', startDate: '', endDate: '' })
+      toast({
+        title: "Vacation Added",
+        description: `Vacation for ${newVacation.doctor} from ${format(startDate, 'yyyy-MM-dd')} to ${format(endDate, 'yyyy-MM-dd')} has been added.`,
+      })
+    }
+  }
+
+  const removeVacation = (index: number) => {
+    setVacations(prev => {
+      const newVacations = [...prev]
+      const removedVacation = newVacations.splice(index, 1)[0]
+      toast({
+        title: "Vacation Removed",
+        description: `Vacation for ${removedVacation.doctor} from ${format(removedVacation.startDate, 'yyyy-MM-dd')} to ${format(removedVacation.endDate, 'yyyy-MM-dd')} has been removed.`,
+      })
+      return newVacations
+    })
+  }
+
+  const addMobileTeamRotation = () => {
+    if (newMobileTeamRotation.doctor && newMobileTeamRotation.startDate && newMobileTeamRotation.endDate) {
+      const startDate = new Date(newMobileTeamRotation.startDate)
+      const endDate = new Date(newMobileTeamRotation.endDate)
+      setMobileTeamRotations(prev => [...prev, { ...newMobileTeamRotation, startDate, endDate }])
+      setNewMobileTeamRotation({ doctor: '', startDate: '', endDate: '' })
+      toast({
+        title: "Mobile Team Rotation Added",
+        description: `Mobile team rotation for ${newMobileTeamRotation.doctor} from ${format(startDate, 'yyyy-MM-dd')} to ${format(endDate, 'yyyy-MM-dd')} has been added.`,
+      })
+    }
+  }
+
+  const removeMobileTeamRotation = (index: number) => {
+    setMobileTeamRotations(prev => {
+      const newRotations = [...prev]
+      const removedRotation = newRotations.splice(index, 1)[0]
+      toast({
+        title: "Mobile Team Rotation Removed",
+        description: `Mobile team rotation for ${removedRotation.doctor} from ${format(removedRotation.startDate, 'yyyy-MM-dd')} to ${format(removedRotation.endDate, 'yyyy-MM-dd')} has been removed.`,
+      })
+      return newRotations
+    })
+  }
+
+  const exportToCSV = () => {
+    let csvContent = "data:text/csv;charset=utf-8,"
+    csvContent += "Date,Day,Year,On-Call Doctor(s),Team(s),Mobile Team\n"
+
+    Object.entries(generatedRota).forEach(([day, entries]) => {
+      const date = new Date(selectedMonth.getFullYear(), selectedMonth.getMonth(), parseInt(day))
+      const doctors = entries.map(e => e.doctor).join(", ")
+      const teams = entries.map(e => e.team).join(", ")
+      const mobileTeamDoctor = mobileTeamRotations.find(rotation => 
+        date >= rotation.startDate && date <= rotation.endDate
+      )?.doctor || ""
+
+      csvContent += `${format(date, 'yyyy-MM-dd')},${format(date, 'EEEE')},${date.getFullYear()},${doctors},${teams},${mobileTeamDoctor}\n`
+    })
+
+    const encodedUri = encodeURI(csvContent)
+    const link = document.createElement("a")
+    link.setAttribute("href", encodedUri)
+    link.setAttribute("download", `oncall_rota_${format(selectedMonth, 'yyyy-MM')}.csv`)
+    document.body.appendChild(link)
+    link.click()
+    document.body.removeChild(link)
+
+    toast({
+      title: "CSV Exported",
+      description: "The on-call schedule has been exported to CSV.",
+    })
+  }
+
+  return (
+    <div className="container mx-auto p-4">
+      <h1 className="text-2xl font-bold mb-4">Clinical Coordinator Oncall Rota Generator</h1>
+      
+      <Tabs defaultValue="settings">
+        <TabsList>
+          <TabsTrigger value="settings">Settings</TabsTrigger>
+          <TabsTrigger value="vacations">Vacations & Mobile Team</TabsTrigger>
+          <TabsTrigger value="schedule">Generated Schedule</TabsTrigger>
+          <TabsTrigger value="summary">Summary</TabsTrigger>
+        </TabsList>
+
+        <TabsContent value="settings">
+          <Card>
+            <CardHeader>
+              <CardTitle>Schedule Settings</CardTitle>
+            </CardHeader>
+            <CardContent>
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                <div>
+                  <Label htmlFor="month">Select Month</Label>
+                  <Select onValueChange={(value) => setSelectedMonth(new Date(value))}>
+                    <SelectTrigger id="month">
+                      <SelectValue placeholder="Select month" />
+                    </SelectTrigger>
+                    <SelectContent>
+                      {Array.from({ length: 12 }, (_, i) => new Date(2023, i, 1)).map((date) => (
+                        <SelectItem key={date.toISOString()} value={date.toISOString()}>
+                          {date.toLocaleString('default', { month: 'long', year: 'numeric' })}
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                </div>
+                <div>
+                  <Label htmlFor="maxOnCalls">Max On-Calls Per Week</Label>
+                  <Input 
+                    id="maxOnCalls"
+                    type="number"
+                    value={customRules.maxOnCallsPerWeek}
+                    onChange={(e) => setCustomRules(prev => ({ ...prev, maxOnCallsPerWeek: parseInt(e.target.value) }))}
+                  />
+                </div>
+                <div>
+                  <Label htmlFor="minDaysBetween">Min Days Between On-Calls</Label>
+                  <Input 
+                    id="minDaysBetween"
+                    type="number"
+                    value={customRules.minDaysBetweenOnCalls}
+                    onChange={(e) => setCustomRules(prev => ({ ...prev, minDaysBetweenOnCalls: parseInt(e.target.value) }))}
+                  />
+                </div>
+              </div>
+              <Button onClick={generateRota} className="mt-4">Generate Schedule</Button>
+            </CardContent>
+          </Card>
+        </TabsContent>
+
+        <TabsContent value="vacations">
+          <Card>
+            <CardHeader>
+              <CardTitle>Vacations & Mobile Team Management</CardTitle>
+            </CardHeader>
+            <CardContent>
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                <div>
+                  <h3 className="text-lg font-semibold mb-2">Add Vacation</h3>
+                  <Select onValueChange={(value) => setNewVacation(prev => ({ ...prev, doctor: value }))}>
+                    <SelectTrigger>
+                      <SelectValue placeholder="Select doctor" />
+                    </SelectTrigger>
+                    <SelectContent>
+                      {allDoctors.map((doctor) => (
+                        <SelectItem key={doctor} value={doctor}>{doctor}</SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                  <div className="flex gap-2 mt-2">
+                    <Input 
+                      type="date" 
+                      placeholder="Start Date" 
+                      value={newVacation.startDate}
+                      onChange={(e) => setNewVacation(prev => ({ ...prev, startDate: e.target.value }))}
+                    />
+                    <Input 
+                      type="date" 
+                      placeholder="End Date" 
+                      value={newVacation.endDate}
+                      onChange={(e) => setNewVacation(prev => ({ ...prev, endDate: e.target.value }))}
+                    />
+                  </div>
+                  <Button className="mt-2" onClick={addVacation}>Add Vacation</Button>
+                </div>
+                <div>
+                  <h3 className="text-lg font-semibold mb-2">Add Mobile Team Rotation</h3>
+                  <Select onValueChange={(value) => setNewMobileTeamRotation(prev => ({ ...prev, doctor: value }))}>
+                    <SelectTrigger>
+                      <SelectValue placeholder="Select doctor" />
+                    </SelectTrigger>
+                    <SelectContent>
+                      {allDoctors.map((doctor) => (
+                        <SelectItem key={doctor} value={doctor}>{doctor}</SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                  <div className="flex gap-2 mt-2">
+                    <Input 
+                      type="date" 
+                      placeholder="Start Date" 
+                      value={newMobileTeamRotation.startDate}
+                      onChange={(e) => setNewMobileTeamRotation(prev => ({ ...prev, startDate: e.target.value }))}
+                    />
+                    <Input 
+                      type="date" 
+                      placeholder="End Date" 
+                      value={newMobileTeamRotation.endDate}
+                      onChange={(e) => setNewMobileTeamRotation(prev => ({ ...prev, endDate: e.target.value }))}
+                    />
+                  </div>
+                  <Button className="mt-2" onClick={addMobileTeamRotation}>Add Mobile Team Rotation</Button>
+                </div>
+              </div>
+              <div className="mt-4">
+                <h3 className="text-lg font-semibold mb-2">Scheduled Vacations</h3>
+                <ScrollArea className="h-[200px]">
+                  {vacations.map((vacation, index) => (
+                    <div key={index} className="flex justify-between items-center mb-2">
+                      <span>{vacation.doctor}: {format(vacation.startDate, 'yyyy-MM-dd')} to {format(vacation.endDate, 'yyyy-MM-dd')}</span>
+                      <Button variant="ghost" size="icon" onClick={() => removeVacation(index)}><X className="h-4 w-4" /></Button>
+                    </div>
+                  ))}
+                </ScrollArea>
+              </div>
+              <div className="mt-4">
+                <h3 className="text-lg font-semibold mb-2">Scheduled Mobile Team Rotations</h3>
+                <ScrollArea className="h-[200px]">
+                  {mobileTeamRotations.map((rotation, index) => (
+                    <div key={index} className="flex justify-between items-center mb-2">
+                      <span>{rotation.doctor}: {format(rotation.startDate, 'yyyy-MM-dd')} to {format(rotation.endDate, 'yyyy-MM-dd')}</span>
+                      <Button variant="ghost" size="icon" onClick={() => removeMobileTeamRotation(index)}><X className="h-4 w-4" /></Button>
+                    </div>
+                  ))}
+                </ScrollArea>
+              </div>
+            </CardContent>
+          </Card>
+        </TabsContent>
+
+        <TabsContent value="schedule">
+          <Card>
+            <CardHeader>
+              <CardTitle>Generated Schedule</CardTitle>
+            </CardHeader>
+            <CardContent>
+              <div className="grid grid-cols-7 gap-1">
+                {['Su', 'Mo', 'Tu', 'We', 'Th', 'Fr', 'Sa'].map(day => (
+                  <div key={day} className="text-center font-bold">{day}</div>
+                ))}
+                {Array.from({ length: 42 }, (_, i) => {
+                  const date = addDays(startOfMonth(selectedMonth), i - startOfMonth(selectedMonth).getDay())
+                  const isCurrentMonth = isSameMonth(date, selectedMonth)
+                  const dayEntries = generatedRota[format(date, 'd')] || []
+                  
+                  return (
+                    <div 
+                      key={i} 
+                      className={`p-1 border ${isCurrentMonth ? 'bg-white' : 'bg-gray-100'} h-24 overflow-hidden`}
+                    >
+                      <div className={`text-sm ${isWeekend(date) ? 'font-bold' : ''} ${isCurrentMonth ? '' : 'text-gray-400'}`}>
+                        {format(date, 'd')}
+                      </div>
+                      <div className="text-xs">
+                        {dayEntries.map((entry, index) => (
+                          <div key={index} className="truncate">
+                            {entry.doctor}
+                            <span className="text-muted-foreground"> ({entry.team})</span>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  )
+                })}
+              </div>
+              {conflicts.length > 0 && (
+                <div className="mt-4">
+                  <h3 className="text-lg font-semibold mb-2">Conflicts</h3>
+                  <ScrollArea className="h-[200px]">
+                    {conflicts.map((conflict, index) => (
+                      <div key={index} className="mb-2">
+                        <p className="font-semibold">{format(conflict.date, 'yyyy-MM-dd')}: {conflict.description}</p>
+                        <ul className="list-disc list-inside">
+                          {conflict.suggestions.map((suggestion, i) => (
+                            <li key={i}>{suggestion}</li>
+                          ))}
+                        </ul>
+                      </div>
+                    ))}
+                  </ScrollArea>
+                </div>
+              )}
+              <Button onClick={exportToCSV} className="mt-4">
+                <Download className="mr-2 h-4 w-4" />
+                Export to CSV
+              </Button>
+            </CardContent>
+          </Card>
+        </TabsContent>
+
+        <TabsContent value="summary">
+          <Card>
+            <CardHeader>
+              <CardTitle>On-Call Summary</CardTitle>
+            </CardHeader>
+            <CardContent>
+              <Table>
+                <TableHeader>
+                  <TableRow>
+                    <TableHead>Doctor</TableHead>
+                    <TableHead>Team</TableHead>
+                    <TableHead>Mid-Week On-Calls</TableHead>
+                    <TableHead>Weekend On-Calls</TableHead>
+                    <TableHead>Total On-Calls</TableHead>
+                    <TableHead>Vacation Days</TableHead>
+                    <TableHead>Mobile Team Days</TableHead>
+                  </TableRow>
+                </TableHeader>
+                <TableBody>
+                  {Object.entries(onCallSummary).map(([doctor, summary]) => (
+                    <TableRow key={doctor}>
+                      <TableCell>{doctor}</TableCell>
+                      <TableCell>{getDoctorTeam(doctor)}</TableCell>
+                      <TableCell>{summary.midWeek}</TableCell>
+                      <TableCell>{summary.weekend}</TableCell>
+                      <TableCell>{summary.total}</TableCell>
+                      <TableCell>{summary.vacation}</TableCell>
+                      <TableCell>{summary.mobileTeam}</TableCell>
+                    </TableRow>
+                  ))}
+                </TableBody>
+              </Table>
+            </CardContent>
+          </Card>
+        </TabsContent>
+      </Tabs>
+
+      <TooltipProvider>
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <Button variant="outline" size="icon" className="fixed bottom-4 right-4">
+              <HelpCircle className="h-4 w-4" />
+            </Button>
+          </TooltipTrigger>
+          <TooltipContent>
+            <p>Need help? Contact support at support@example.com</p>
+          </TooltipContent>
+        </Tooltip>
+      </TooltipProvider>
+    </div>
+  )
+}
